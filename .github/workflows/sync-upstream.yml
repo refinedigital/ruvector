@@ -20,14 +20,25 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Sync main from upstream
+        id: sync
         run: |
           git remote add upstream https://github.com/ruvnet/ruvector.git
           git fetch upstream
           git checkout main
+          BEFORE=$(git rev-parse HEAD)
           git merge upstream/main --ff-only
-          git push origin main
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push origin main
+            echo "Main updated: $BEFORE → $AFTER"
+          fi
 
       - name: Rebase arm64-fixes onto updated main
+        if: steps.sync.outputs.changed == 'true'
         run: |
           git fetch origin arm64-fixes
           git checkout arm64-fixes
@@ -40,6 +51,7 @@ jobs:
           fi
 
       - name: Check if arm64-fixes is still needed
+        if: steps.sync.outputs.changed == 'true'
         run: |
           if ! grep -q 'as \*const i8' crates/ruvector-postgres/src/types/vector.rs && \
              ! grep -q 'as \*mut i8' crates/ruvector-postgres/src/types/vector.rs; then
