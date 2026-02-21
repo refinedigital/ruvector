@@ -16,6 +16,7 @@ use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::os::raw::c_char;
 use std::ptr;
 use std::str::FromStr;
 
@@ -652,7 +653,7 @@ pub extern "C" fn ruvector_typmod_in(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys
         };
 
         // Get pointer to first cstring element
-        let first_elem_ptr = (array_ptr as *const u8).add(data_offset) as *const i8;
+        let first_elem_ptr = (array_ptr as *const u8).add(data_offset) as *const c_char;
 
         if first_elem_ptr.is_null() {
             pgrx::error!("ruvector type modifier element is null");
@@ -713,7 +714,7 @@ pub extern "C" fn ruvector_typmod_out(fcinfo: pg_sys::FunctionCallInfo) -> pg_sy
 
         // Allocate in PostgreSQL memory
         let len = c_str.as_bytes_with_nul().len();
-        let pg_str = pg_sys::palloc(len) as *mut i8;
+        let pg_str = pg_sys::palloc(len) as *mut c_char;
         ptr::copy_nonoverlapping(c_str.as_ptr(), pg_str, len);
 
         pg_sys::Datum::from(pg_str)
