@@ -62,6 +62,14 @@ impl Sampler {
     /// Sample a token id from `logits`, applying repetition penalty over
     /// `recent` tokens, temperature, top-k and top-p filtering.
     pub fn sample(&mut self, logits: &[f32], recent: &[u32]) -> u32 {
+        // Zero-alloc fast path: greedy with no repetition penalty needs no copy.
+        if self.cfg.temperature <= 0.0
+            && ((self.cfg.repetition_penalty - 1.0).abs() <= f32::EPSILON
+                || self.cfg.repetition_window == 0)
+        {
+            return argmax(logits);
+        }
+
         let mut work = logits.to_vec();
 
         // Repetition penalty.

@@ -52,14 +52,18 @@ impl LtiInjection {
     }
 }
 
-/// Per-depth LoRA: `delta = (down(x) ⊙ scale[t]) @ B`, with a learned scale row
-/// per loop iteration (clamped to the last row beyond the training maximum).
+/// Per-depth LoRA: `delta = down(x) @ effective_w[t]` where
+/// `effective_w[t] = diag(scale[t]) @ B` is precomputed at load time.
+///
+/// Original: `delta = (down(x) ⊙ scale[t]) @ B`.
+/// Equivalent: `down(x) @ (scale[t].unsqueeze(1) * B)` = `down(x) @ effective_w[t]`.
+/// Precomputing saves 3 kernel ops (narrow, reshape, broadcast_mul on scale)
+/// per ACT loop iteration.
 pub struct DepthLora {
     down: Linear,
-    b_mat: Tensor, // [rank, dim]
-    scale: Tensor, // [max_loops, rank]
+    /// `[max_loop_iters]` × `[rank, dim]` — one fused weight per depth index.
+    effective_w: Vec<Tensor>,
     rank: usize,
-    max_rows: usize,
 }
 
 impl DepthLora {
@@ -70,35 +74,31 @@ impl DepthLora {
         let scale = vb
             .get((cfg.max_loop_iters, cfg.lora_rank), "scale")
             .map_err(cand)?;
-        Ok(Self {
-            down,
-            b_mat,
-            scale,
-            rank: cfg.lora_rank,
-            max_rows: cfg.max_loop_iters,
-        })
+        // effective_w[t] = scale[t, :, None] * b_mat  →  [rank, dim]
+        let effective_w = (0..cfg.max_loop_iters)
+            .map(|t| {
+                let scale_t = scale
+                    .narrow(0, t, 1)
+                    .map_err(cand)?
+                    .reshape((cfg.lora_rank, 1))
+                    .map_err(cand)?; // [rank, 1]
+                scale_t.broadcast_mul(&b_mat).map_err(cand) // [rank, dim]
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { down, effective_w, rank: cfg.lora_rank })
     }
 
     pub fn forward(&self, x: &Tensor, t: usize) -> Result<Tensor> {
         let (b, seq, _dim) = x.dims3().map_err(cand)?;
-        let row = t.min(self.max_rows - 1);
-        let scale_t = self
-            .scale
-            .narrow(0, row, 1)
+        let w = &self.effective_w[t.min(self.effective_w.len() - 1)];
+        let dim = w.dim(1).map_err(cand)?;
+        let d = self.down.forward(x).map_err(cand)?; // [b, seq, rank]
+        d.reshape((b * seq, self.rank))
             .map_err(cand)?
-            .reshape((1, 1, self.rank))
-            .map_err(cand)?; // [1,1,rank]
-        let d = self.down.forward(x).map_err(cand)?; // [b,seq,rank]
-        let d = d.broadcast_mul(&scale_t).map_err(cand)?;
-        let dim = self.b_mat.dim(1).map_err(cand)?;
-        let delta = d
-            .reshape((b * seq, self.rank))
-            .map_err(cand)?
-            .matmul(&self.b_mat)
+            .matmul(w)
             .map_err(cand)?
             .reshape((b, seq, dim))
-            .map_err(cand)?;
-        Ok(delta)
+            .map_err(cand)
     }
 }
 
