@@ -96,29 +96,30 @@ impl MythosCache {
         device: &candle_core::Device,
         dtype: candle_core::DType,
     ) -> candle_core::Result<Self> {
-        // Allocate [b, kv_heads, max_seq, head_dim] — compact buffer, repeat_kv
-        // still needed but scatter_set avoids O(N²) cat bandwidth.
-        let kv_heads = cfg.n_kv_heads;
-        let head_dim = cfg.head_dim();
         let max_seq = cfg.max_seq_len;
         let mk_buf = |_| -> candle_core::Result<Option<KvLayerCache>> {
-            let k = candle_core::Tensor::zeros((b, kv_heads, max_seq, head_dim), dtype, device)?;
-            let v = candle_core::Tensor::zeros((b, kv_heads, max_seq, head_dim), dtype, device)?;
-            Ok(Some(KvLayerCache::GqaPrealloc { k, v, seq_len: 0, max_seq }))
+            match cfg.attn_type {
+                AttnType::Gqa => {
+                    let kv_heads = cfg.n_kv_heads;
+                    let head_dim = cfg.head_dim();
+                    let k = candle_core::Tensor::zeros((b, kv_heads, max_seq, head_dim), dtype, device)?;
+                    let v = candle_core::Tensor::zeros((b, kv_heads, max_seq, head_dim), dtype, device)?;
+                    Ok(Some(KvLayerCache::GqaPrealloc { k, v, seq_len: 0, max_seq }))
+                }
+                AttnType::Mla => {
+                    let c_kv = candle_core::Tensor::zeros((b, max_seq, cfg.kv_lora_rank), dtype, device)?;
+                    let k_rope = candle_core::Tensor::zeros((b, max_seq, cfg.qk_rope_head_dim), dtype, device)?;
+                    Ok(Some(KvLayerCache::MlaPrealloc { c_kv, k_rope, seq_len: 0, max_seq }))
+                }
+            }
         };
-        // MLA layers share the same pre-alloc approach but use a different shape;
-        // for now only pre-alloc for GQA (AttnType::Gqa).
-        let prelude = if cfg.attn_type == AttnType::Gqa {
-            (0..cfg.prelude_layers).map(|_| mk_buf(())).collect::<candle_core::Result<Vec<_>>>()?
-        } else {
-            vec![None; cfg.prelude_layers]
-        };
-        let recurrent = if cfg.attn_type == AttnType::Gqa { mk_buf(())? } else { None };
-        let coda = if cfg.attn_type == AttnType::Gqa {
-            (0..cfg.coda_layers).map(|_| mk_buf(())).collect::<candle_core::Result<Vec<_>>>()?
-        } else {
-            vec![None; cfg.coda_layers]
-        };
+        let prelude = (0..cfg.prelude_layers)
+            .map(|_| mk_buf(()))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let recurrent = mk_buf(())?;
+        let coda = (0..cfg.coda_layers)
+            .map(|_| mk_buf(()))
+            .collect::<candle_core::Result<Vec<_>>>()?;
         Ok(Self { prelude, recurrent, coda, seq_len: 0 })
     }
 
@@ -126,10 +127,10 @@ impl MythosCache {
     pub fn reset(&mut self) {
         for c in &mut self.prelude {
             // For GqaPrealloc, reset seq_len (the buffer is reused).
-            if let Some(KvLayerCache::GqaPrealloc { seq_len, .. }) = c {
-                *seq_len = 0;
-            } else {
-                *c = None;
+            match c {
+                Some(KvLayerCache::GqaPrealloc { seq_len, .. })
+                | Some(KvLayerCache::MlaPrealloc { seq_len, .. }) => *seq_len = 0,
+                _ => *c = None,
             }
         }
         if let Some(KvLayerCache::GqaPrealloc { seq_len, .. }) = &mut self.recurrent {
@@ -138,10 +139,10 @@ impl MythosCache {
             self.recurrent = None;
         }
         for c in &mut self.coda {
-            if let Some(KvLayerCache::GqaPrealloc { seq_len, .. }) = c {
-                *seq_len = 0;
-            } else {
-                *c = None;
+            match c {
+                Some(KvLayerCache::GqaPrealloc { seq_len, .. })
+                | Some(KvLayerCache::MlaPrealloc { seq_len, .. }) => *seq_len = 0,
+                _ => *c = None,
             }
         }
         self.seq_len = 0;

@@ -23,8 +23,16 @@ pub enum KvLayerCache {
         max_seq: usize,
     },
     /// MLA: compressed latent `[b, len, kv_lora_rank]` and rotated shared
-    /// rope keys `[b, len, qk_rope_head_dim]`.
+    /// rope keys `[b, len, qk_rope_head_dim]`. Grows via cat (legacy path).
     Mla { c_kv: Tensor, k_rope: Tensor },
+    /// MLA pre-allocated: same semantics as GqaPrealloc but for the two MLA
+    /// tensors. Shape: `[b, max_seq, kv_lora_rank]` and `[b, max_seq, qk_rope]`.
+    MlaPrealloc {
+        c_kv: Tensor,
+        k_rope: Tensor,
+        seq_len: usize,
+        max_seq: usize,
+    },
 }
 
 impl KvLayerCache {
@@ -34,6 +42,7 @@ impl KvLayerCache {
             KvLayerCache::Gqa { k, .. } => k.dim(2).unwrap_or(0),
             KvLayerCache::GqaPrealloc { seq_len, .. } => *seq_len,
             KvLayerCache::Mla { c_kv, .. } => c_kv.dim(1).unwrap_or(0),
+            KvLayerCache::MlaPrealloc { seq_len, .. } => *seq_len,
         }
     }
 
@@ -341,12 +350,36 @@ impl MlaAttention {
             .reshape((b, seq, self.qk_rope))
             .map_err(cand)?;
 
-        let (c_kv_full, k_rope_store) = match past {
-            Some(KvLayerCache::Mla { c_kv, k_rope }) => (
-                Tensor::cat(&[c_kv, &c_kv_cur], 1).map_err(cand)?,
-                Tensor::cat(&[k_rope, &k_rope_cur_store], 1).map_err(cand)?,
-            ),
-            _ => (c_kv_cur, k_rope_cur_store),
+        let (c_kv_full, k_rope_store, new_mla_cache) = match past {
+            // Pre-allocated MLA: O(1) scatter_set vs O(N) cat.
+            Some(KvLayerCache::MlaPrealloc { c_kv: buf_ckv, k_rope: buf_rope, seq_len, max_seq }) => {
+                let idx_ckv = Tensor::full(*seq_len as u32, c_kv_cur.shape(), c_kv_cur.device())
+                    .map_err(cand)?;
+                buf_ckv.scatter_set(&idx_ckv, &c_kv_cur, 1).map_err(cand)?;
+                let idx_rope = Tensor::full(*seq_len as u32, k_rope_cur_store.shape(), k_rope_cur_store.device())
+                    .map_err(cand)?;
+                buf_rope.scatter_set(&idx_rope, &k_rope_cur_store, 1).map_err(cand)?;
+                let new_seq = seq_len + seq;
+                let ckv_v = buf_ckv.narrow(1, 0, new_seq).map_err(cand)?;
+                let rope_v = buf_rope.narrow(1, 0, new_seq).map_err(cand)?;
+                let cache = KvLayerCache::MlaPrealloc {
+                    c_kv: buf_ckv.clone(),
+                    k_rope: buf_rope.clone(),
+                    seq_len: new_seq,
+                    max_seq: *max_seq,
+                };
+                (ckv_v, rope_v, cache)
+            }
+            Some(KvLayerCache::Mla { c_kv, k_rope }) => {
+                let c = Tensor::cat(&[c_kv, &c_kv_cur], 1).map_err(cand)?;
+                let r = Tensor::cat(&[k_rope, &k_rope_cur_store], 1).map_err(cand)?;
+                let cache = KvLayerCache::Mla { c_kv: c.clone(), k_rope: r.clone() };
+                (c, r, cache)
+            }
+            _ => {
+                let cache = KvLayerCache::Mla { c_kv: c_kv_cur.clone(), k_rope: k_rope_cur_store.clone() };
+                (c_kv_cur, k_rope_cur_store, cache)
+            }
         };
         let kv_len = c_kv_full.dim(1).map_err(cand)?;
 
@@ -389,12 +422,6 @@ impl MlaAttention {
             .reshape((b, seq, self.n_heads * self.v_head_dim))
             .map_err(cand)?;
         let out = self.o_proj.forward(&ctx).map_err(cand)?;
-        Ok((
-            out,
-            KvLayerCache::Mla {
-                c_kv: c_kv_full,
-                k_rope: k_rope_store,
-            },
-        ))
+        Ok((out, new_mla_cache))
     }
 }
