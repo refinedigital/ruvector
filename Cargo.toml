@@ -238,6 +238,8 @@ members = [
     # Calculus of emergent / relational time (Wheeler-DeWitt, Page-Wootters,
     # entropic, thermal) + Structural Proper Time for agentic systems.
     "crates/emergent-time",
+    # Online HNSW graph repair after vector deletions (ADR-258)
+    "crates/ruvector-hnsw-repair",
 ]
 resolver = "2"
 
