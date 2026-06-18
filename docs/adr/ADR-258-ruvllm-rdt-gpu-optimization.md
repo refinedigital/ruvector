@@ -103,6 +103,39 @@ On CPU, the vectorized path adds small overhead for tensor-operator dispatch ver
 
 ---
 
+## Post-merge optimizations (main, 2026-06-18)
+
+After PR #589 merged, a `/loop 5m until sota` sweep added the following improvements directly to `main`:
+
+### Load-time caching
+
+| What | Where | Saves per forward pass |
+|------|-------|----------------------|
+| RoPE cos/sin `[max_seq, head_dim]` | `mod.rs`, `rdt.rs` | `from_vec` + H2D upload + matmul + cos/sin per call |
+| Causal mask `[max_seq, max_seq]` | `mod.rs`, `rdt.rs` | O(max_seq²) CPU construction + H2D upload |
+| LTI diagonal `A = exp(-exp(log_dt+log_A))` | `recurrent.rs` | 5 kernel ops × max_loop_iters |
+| DepthLora `effective_w[t] = diag(scale[t]) @ B` | `recurrent.rs` | narrow+reshape+broadcast_mul per ACT iteration |
+| ACT step tensors `(t+1)` for depth tracking | `recurrent.rs` | `Tensor::new` + broadcast + cast per iteration |
+
+### Inference path
+
+| What | Where | Savings |
+|------|-------|---------|
+| `from_slice` instead of `from_vec(to_vec())` | `mod.rs`, `rdt.rs` | One heap alloc + copy per prompt + per decode token |
+| `Tensor::argmax` on GPU for greedy | `mod.rs`, `rdt.rs` | 128 KB → 4 bytes per decode step |
+| `sort_last_dim` + top-k narrow for temperature sampling | `mod.rs`, `sampling.rs` | 128 KB → ~320 B per sampling decode step |
+| `sample_topk` fast-path for sorted candidates | `sampling.rs` | Skip O(vocab) copy + CPU sort |
+| Greedy no-alloc fast-path (temp=0, no rep penalty) | `sampling.rs` | Skip `logits.to_vec()` entirely |
+
+### Generation
+
+| What | Where | Effect |
+|------|-------|--------|
+| `generate_stream_sampled(callback)` | `mod.rs`, `recurrent_backend.rs` | True per-token streaming; TTFT = 1 decode step |
+| True streaming in `generate_stream_v2` | `recurrent_backend.rs` | Tokens sent through channel immediately, not after full generation |
+
+---
+
 ## Alternatives Considered
 
 **Periodic early-exit check (every 4 iterations)**  
