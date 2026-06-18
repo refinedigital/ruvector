@@ -771,7 +771,6 @@ mod candle_impl {
                 return Err(RuvLLMError::Generation("empty prompt".into()));
             }
             let mut cache = RdtCache::new();
-            // Use from_slice to avoid a to_vec() copy on the prompt.
             let prompt =
                 Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
                     .map_err(cand)?;
@@ -784,13 +783,104 @@ mod candle_impl {
                 if Some(next) == eos {
                     break;
                 }
-                // from_slice on a stack array avoids heap allocation per decode step.
                 let step =
                     Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
                 let logits = self.forward_cached(&step, &mut cache)?;
                 next = last_argmax(&logits)?;
             }
             Ok(out)
+        }
+
+        /// Autoregressive generation with configurable sampling. Uses GPU top-k
+        /// sort + on-device argmax — same optimised path as `OpenMythos`.
+        pub fn generate_sampled(
+            &self,
+            prompt_ids: &[u32],
+            max_new_tokens: usize,
+            eos: Option<u32>,
+            sampling: crate::models::sampling::SamplingConfig,
+        ) -> Result<Vec<u32>> {
+            if prompt_ids.is_empty() {
+                return Err(RuvLLMError::Generation("empty prompt".into()));
+            }
+            let top_k_transfer = if sampling.top_k > 0 {
+                sampling.top_k
+            } else {
+                512.min(self.cfg.vocab_size)
+            };
+            let mut sampler = crate::models::sampling::Sampler::new(sampling);
+            let mut cache = RdtCache::new();
+            let mut history: Vec<u32> = prompt_ids.to_vec();
+
+            let prompt =
+                Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                    .map_err(cand)?;
+            let logits = self.forward_cached(&prompt, &mut cache)?;
+            let (vals, idxs) = last_logits_topk(&logits, top_k_transfer, &self.device)?;
+            let mut next = sampler.sample_topk(&vals, &idxs, &history);
+
+            let mut out = Vec::with_capacity(max_new_tokens);
+            for _ in 0..max_new_tokens {
+                out.push(next);
+                history.push(next);
+                if Some(next) == eos {
+                    break;
+                }
+                let step =
+                    Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
+                let logits = self.forward_cached(&step, &mut cache)?;
+                let (vals, idxs) =
+                    last_logits_topk(&logits, top_k_transfer, &self.device)?;
+                next = sampler.sample_topk(&vals, &idxs, &history);
+            }
+            Ok(out)
+        }
+
+        /// Token-by-token streaming generation via callback (same pattern as
+        /// `OpenMythos::generate_stream_sampled`).
+        pub fn generate_stream_sampled(
+            &self,
+            prompt_ids: &[u32],
+            max_new_tokens: usize,
+            eos: Option<u32>,
+            sampling: crate::models::sampling::SamplingConfig,
+            mut on_token: impl FnMut(u32) -> bool,
+        ) -> Result<()> {
+            if prompt_ids.is_empty() {
+                return Err(RuvLLMError::Generation("empty prompt".into()));
+            }
+            let top_k_transfer = if sampling.top_k > 0 {
+                sampling.top_k
+            } else {
+                512.min(self.cfg.vocab_size)
+            };
+            let mut sampler = crate::models::sampling::Sampler::new(sampling);
+            let mut cache = RdtCache::new();
+            let mut history: Vec<u32> = prompt_ids.to_vec();
+
+            let prompt =
+                Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                    .map_err(cand)?;
+            let logits = self.forward_cached(&prompt, &mut cache)?;
+            let (vals, idxs) = last_logits_topk(&logits, top_k_transfer, &self.device)?;
+            let mut next = sampler.sample_topk(&vals, &idxs, &history);
+
+            for _ in 0..max_new_tokens {
+                if !on_token(next) {
+                    break;
+                }
+                history.push(next);
+                if Some(next) == eos {
+                    break;
+                }
+                let step =
+                    Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
+                let logits = self.forward_cached(&step, &mut cache)?;
+                let (vals, idxs) =
+                    last_logits_topk(&logits, top_k_transfer, &self.device)?;
+                next = sampler.sample_topk(&vals, &idxs, &history);
+            }
+            Ok(())
         }
 
         /// The deep recurrent loop with per-token adaptive halting.
@@ -903,6 +993,36 @@ mod candle_impl {
             self.kv = None;
             self.seq_len = 0;
         }
+    }
+
+    /// Extract sorted top-k `(values, token_ids)` at the last position using
+    /// on-device sort — transfers `2 * k * 4` bytes instead of `vocab * 4`.
+    fn last_logits_topk(
+        logits: &Tensor,
+        k: usize,
+        _device: &Device,
+    ) -> Result<(Vec<f32>, Vec<u32>)> {
+        let (_b, seq, vocab) = logits.dims3().map_err(cand)?;
+        let last = logits
+            .i((0, seq - 1))
+            .map_err(cand)?
+            .to_dtype(DType::F32)
+            .map_err(cand)?
+            .contiguous()
+            .map_err(cand)?;
+        let k = if k == 0 || k >= vocab { vocab } else { k };
+        let (vals, idxs) = last.sort_last_dim(false).map_err(cand)?;
+        let vals_k: Vec<f32> = vals
+            .narrow(D::Minus1, 0, k)
+            .map_err(cand)?
+            .to_vec1()
+            .map_err(cand)?;
+        let idxs_k: Vec<u32> = idxs
+            .narrow(D::Minus1, 0, k)
+            .map_err(cand)?
+            .to_vec1()
+            .map_err(cand)?;
+        Ok((vals_k, idxs_k))
     }
 
     /// Argmax over vocab at the last sequence position of `[1, seq, vocab]`.
