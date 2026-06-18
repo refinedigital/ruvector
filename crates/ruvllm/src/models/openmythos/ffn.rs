@@ -129,10 +129,12 @@ impl MoeFfn {
             if n_e == 0 {
                 continue;
             }
-            let idx = Tensor::from_vec(tok_ids[e].clone(), (n_e,), &device).map_err(cand)?;
+            // from_slice avoids the .clone() heap allocation per expert.
+            let idx =
+                Tensor::from_slice(&tok_ids[e], (n_e,), &device).map_err(cand)?;
             let gathered = flat.index_select(&idx, 0).map_err(cand)?; // [n_e, dim]
             let y = expert.forward(&gathered)?;
-            let w = Tensor::from_vec(tok_w[e].clone(), (n_e, 1), &device)
+            let w = Tensor::from_slice(&tok_w[e], (n_e, 1), &device)
                 .map_err(cand)?
                 .to_dtype(dtype)
                 .map_err(cand)?;
